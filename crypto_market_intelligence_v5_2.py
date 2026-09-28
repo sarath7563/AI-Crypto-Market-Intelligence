@@ -20,6 +20,8 @@ APP_TITLE="AI Crypto Research Terminal V5.2"
 DB_PATH=Path("crypto_market.db")
 CACHE_DIR=Path(".crypto_cache_v5"); CACHE_DIR.mkdir(exist_ok=True)
 BINANCE="https://api.binance.com/api/v3"
+KUCOIN="https://api.kucoin.com"
+GATE="https://api.gateio.ws/api/v4"
 COINGECKO="https://api.coingecko.com/api/v3"
 COINPAPRIKA="https://api.coinpaprika.com/v1"
 CG_KEY=os.getenv("COINGECKO_API_KEY","").strip()
@@ -83,21 +85,59 @@ def binance_klines(symbol, interval, limit=1000):
         return d[['date','open','high','low','close','volume','quote_volume','trades']].dropna().reset_index(drop=True)
     except Exception: return pd.DataFrame()
 
-def cp_search(name, symbol):
-    q=str(symbol or name or "").strip()
-    if not q: return None
+def kucoin_klines(symbol, interval, days=365):
+    """Public KuCoin spot candles. No API key is required."""
+    type_map={"1h":"1hour","4h":"4hour","1d":"1day","1W":"1week"}
+    ktype=type_map.get(interval)
+    if not ktype: return pd.DataFrame()
+    pair=f"{str(symbol).upper().strip()}-USDT"
+    now=int(time.time()); start=now-int(days*86400)
+    # KuCoin returns at most 1500 candles per request; the requested windows
+    # below stay within that limit for the timeframes used by this app.
     try:
-        data=get_json(COINPAPRIKA,"/search/",{"q":q,"c":"currencies","limit":10},86400,1)
-        items=data.get("currencies",[]) if isinstance(data,dict) else []
-        target_sym=str(symbol or "").lower()
-        target_name=str(name or "").lower()
-        exact=[x for x in items if str(x.get("symbol","" )).lower()==target_sym]
-        if exact: return exact[0].get("id")
-        exact=[x for x in items if str(x.get("name","" )).lower()==target_name]
-        if exact: return exact[0].get("id")
-        return items[0].get("id") if items else None
+        data=get_json(KUCOIN,"/api/v1/market/candles",{"symbol":pair,"type":ktype,"startAt":start,"endAt":now},600,1)
+        rows=data.get("data",[]) if isinstance(data,dict) else []
+        if not rows: return pd.DataFrame()
+        d=pd.DataFrame(rows)
+        if d.shape[1] < 6: return pd.DataFrame()
+        d=d.iloc[:,:7].copy()
+        d.columns=['ts','open','close','high','low','volume','quote_volume']
+        d['date']=pd.to_datetime(pd.to_numeric(d.ts,errors='coerce'),unit='s',utc=True)
+        for c in ['open','high','low','close','volume','quote_volume']:
+            d[c]=pd.to_numeric(d[c],errors='coerce')
+        return d[['date','open','high','low','close','volume','quote_volume']].dropna().sort_values('date').reset_index(drop=True)
     except Exception:
-        return None
+        return pd.DataFrame()
+
+def gate_klines(symbol, interval, days=365):
+    """Public Gate spot candles. No API key is required."""
+    interval_map={"1h":"1h","4h":"4h","1d":"1d","1W":"7d"}
+    gi=interval_map.get(interval)
+    if not gi: return pd.DataFrame()
+    pair=f"{str(symbol).upper().strip()}_USDT"
+    try:
+        # Gate accepts up to 1000 points per request.
+        limit=min(1000,max(220,int(days*86400/max(3600,{'1h':3600,'4h':14400,'1d':86400,'7d':604800}.get(gi,86400)))))
+        data=get_json(GATE,"/spot/candlesticks",{"currency_pair":pair,"interval":gi,"limit":limit},600,1)
+        if not isinstance(data,list) or not data: return pd.DataFrame()
+        d=pd.DataFrame(data)
+        if d.shape[1] < 7: return pd.DataFrame()
+        d=d.iloc[:,:7].copy()
+        d.columns=['ts','quote_volume','close','high','low','open','volume']
+        d['date']=pd.to_datetime(pd.to_numeric(d.ts,errors='coerce'),unit='s',utc=True)
+        for c in ['open','high','low','close','volume','quote_volume']:
+            d[c]=pd.to_numeric(d[c],errors='coerce')
+        return d[['date','open','high','low','close','volume','quote_volume']].dropna().sort_values('date').reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+def exchange_klines(symbol, interval='1d', days=365):
+    """Try public exchange spot candles for coins not listed on Binance."""
+    for fn,name in [(kucoin_klines,'KuCoin Spot'),(gate_klines,'Gate Spot')]:
+        d=fn(symbol,interval,days)
+        if len(d)>=80:
+            return d,name
+    return pd.DataFrame(),None
 
 def cp_daily(name, symbol, days=365):
     cp_id=cp_search(name, symbol)
@@ -134,21 +174,25 @@ def cg_daily(coin_id,days=730, name="", symbol=""):
         try:
             return cp_daily(name,symbol,min(days,365)), 'CoinPaprika daily fallback'
         except Exception as cp_error:
-            raise RuntimeError(f"CoinGecko authentication/data request failed ({cg_error}). Fallback also failed ({cp_error}). Set COINGECKO_API_KEY in .env or use a coin available on Binance.")
+            raise RuntimeError(f"No usable historical data provider succeeded. CoinGecko: {cg_error}. CoinPaprika: {cp_error}. The engine also tried Binance, KuCoin and Gate public spot candles before this point. For broader CoinGecko coverage, add COINGECKO_API_KEY to .env.")
 
 def load_base(sel,days=730):
     b=binance_klines(sel.symbol,'1d',min(1000,max(365,days)))
     if len(b)>=250: return b,'Binance Spot'
+    ex,ex_source=exchange_klines(sel.symbol,'1d',min(365,days))
+    if len(ex)>=180: return ex,ex_source
     d,source=cg_daily(sel.id,days,str(sel['name']),str(sel['symbol']))
     return d,source
 
 def timeframe_data(sel,tf):
-    # Prefer native Binance candles for intraday. For 2D/1W resample daily data.
+    # Prefer native exchange candles for each requested timeframe. For 2D/1W resample daily data.
     if tf in {'1h','4h'}:
         b=binance_klines(sel.symbol,tf,1000)
         if len(b)>=220: return b,'Binance Spot'
-        base,_=load_base(sel,365)
-        return base,'CoinGecko daily fallback (intraday timeframe unavailable)'
+        ex,ex_source=exchange_klines(sel.symbol,tf,365 if tf=='4h' else 90)
+        if len(ex)>=220: return ex,ex_source
+        base,base_source=load_base(sel,365)
+        return base,f'{base_source} daily fallback (native {tf} unavailable)'
     base,source=load_base(sel,365)
     return resample_ohlc(base,'2D' if tf=='2D' else '1W'),source
 
@@ -378,7 +422,7 @@ if run or st.session_state.get('key')!=key:
         st.session_state.pop('result',None); st.session_state['error']=str(e)
 
 if st.session_state.get('error'):
-    st.error('Analysis could not be completed'); st.code(st.session_state['error']); st.info('Provider order: Binance Spot → CoinGecko → CoinPaprika daily fallback. If CoinGecko returns 401, the engine automatically tries CoinPaprika for up to 365 days. No fake market data is generated.')
+    st.error('Analysis could not be completed'); st.code(st.session_state['error']); st.info('Provider order: Binance Spot → KuCoin Spot → Gate Spot → CoinGecko → CoinPaprika. For non-Binance coins, the engine first tries public exchange candles so charts, Smart Money analysis and prediction can use real OHLCV data. No fake market data is generated.')
 R=st.session_state.get('result')
 if R:
     d=R['base']; s=R['structure']; setup=R['setup']; ai=R['ai']; last=d.iloc[-1]
